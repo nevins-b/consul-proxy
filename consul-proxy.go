@@ -8,12 +8,15 @@ import (
 	"net"
 	"time"
 
+	"code.google.com/p/go-uuid/uuid"
+
 	"github.com/hashicorp/consul/api"
 )
 
 var connid = uint64(0)
-var port = flag.String("p", ":8000", "Listen Port")
-var key = flag.String("k", "upstream", "Consul key of backend")
+var listenAddress = flag.String("listen", "127.0.0.1:8000", "Listen address")
+var consulServer = flag.String("consul", "127.0.0.1:8500", "Address of Consul Server")
+var service = flag.String("service", "upstream", "Service name in Consul")
 var verbose = flag.Bool("v", false, "display server actions")
 var veryverbose = flag.Bool("vv", false, "display server actions and all tcp data")
 
@@ -42,47 +45,53 @@ func (p *proxy) err(s string, err error) {
 func (p *proxy) start(nodes []*api.CatalogService) {
 	defer p.lconn.Close()
 	if len(nodes) == 0 {
-		p.log <- fmt.Sprintf("No backend servers available!")
+		p.log <- fmt.Sprintf("%s No backend servers available!", p.prefix)
 		return
 	}
 	order := rand.Perm(len(nodes))
-	for _, i := range order {
+	for i := range order {
 		node := nodes[i]
 		remoteAddr := fmt.Sprintf("%s:%d", node.Address, node.ServicePort)
 		raddr, err := net.ResolveTCPAddr("tcp", remoteAddr)
 		if err == nil {
-			rconn, err := net.DialTCP("tcp", nil, p.raddr)
+			rconn, err := net.DialTCP("tcp", nil, raddr)
 			if err == nil {
 				p.raddr = raddr
 				p.rconn = rconn
 				break
+			} else {
+				p.log <- fmt.Sprintf("%s Error connecting to %s: %s", p.prefix, remoteAddr, err.Error())
 			}
+		} else {
+			p.log <- fmt.Sprintf("%s Error resolving %s: %s", p.prefix, remoteAddr, err.Error())
 		}
-		if i == len(nodes) {
-			p.log <- "Could not connect to any upstream servers!"
+		if i+1 == len(nodes) {
+			p.log <- fmt.Sprintf("%s Could not connect to any upstream servers!", p.prefix)
 			return
 		}
 	}
 
 	defer p.rconn.Close()
 	//display both ends
-	p.log <- fmt.Sprintf("Opened %s >>> %s", p.lconn.RemoteAddr().String(), p.rconn.RemoteAddr().String())
+	p.log <- fmt.Sprintf("%s Opened %s >>> %s", p.prefix, p.lconn.RemoteAddr().String(), p.rconn.RemoteAddr().String())
 	//bidirectional copy
 	go p.pipe(p.lconn, p.rconn)
 	go p.pipe(p.rconn, p.lconn)
 	//wait for close...
 	<-p.errsig
-	p.log <- fmt.Sprintf("Closed (%d bytes sent, %d bytes recieved)", p.sentBytes, p.receivedBytes)
+	p.log <- fmt.Sprintf("%s Closed (%d bytes sent, %d bytes recieved)", p.prefix, p.sentBytes, p.receivedBytes)
 }
 
 func (p *proxy) pipe(src, dst *net.TCPConn) {
 	//data direction
 	var f, h string
 	islocal := src == p.lconn
-	if islocal {
-		f = ">>> %d bytes sent%s"
-	} else {
-		f = "<<< %d bytes recieved%s"
+	if *verbose {
+		if islocal {
+			f = ">>> %d bytes sent%s"
+		} else {
+			f = "<<< %d bytes recieved%s"
+		}
 	}
 	h = "%s"
 
@@ -101,7 +110,7 @@ func (p *proxy) pipe(src, dst *net.TCPConn) {
 		//show output
 		if *veryverbose {
 			p.log <- fmt.Sprintf(f, n, "\n"+fmt.Sprintf(h, b))
-		} else {
+		} else if *verbose {
 			p.log <- fmt.Sprintf(f, n, "")
 		}
 		//write out result
@@ -153,7 +162,7 @@ func main() {
 
 	mc := make(chan string)
 
-	laddr, err := net.ResolveTCPAddr("tcp", *port)
+	laddr, err := net.ResolveTCPAddr("tcp", *listenAddress)
 	check(err, mc)
 
 	listener, err := net.ListenTCP("tcp", laddr)
@@ -162,8 +171,11 @@ func main() {
 	consulChannel := make(chan []*api.CatalogService, 1)
 
 	options := &api.QueryOptions{}
-	client, _ := api.NewClient(api.DefaultConfig())
-	go consulQuery(*key, "", client, options, consulChannel)
+	config := api.DefaultConfig()
+	config.Address = *consulServer
+	client, _ := api.NewClient(config)
+	go consulQuery(*service, "", client, options, consulChannel)
+
 	go logger(mc)
 
 	var nodes []*api.CatalogService
@@ -171,11 +183,14 @@ func main() {
 	for {
 		nodes = <-consulChannel
 		if len(nodes) > 0 {
+			for _, node := range nodes {
+				fmt.Println(node.Address)
+			}
 			break
 		}
 	}
 
-	mc <- fmt.Sprintf("Starting listener on '%s'\n", *port)
+	mc <- fmt.Sprintf("Starting listener on '%s'\n", *listenAddress)
 	for {
 		conn, err := listener.AcceptTCP()
 		if err != nil {
@@ -195,7 +210,7 @@ func main() {
 			laddr:  laddr,
 			erred:  false,
 			errsig: make(chan bool),
-			prefix: fmt.Sprintf("Connection #%03d ", connid),
+			prefix: fmt.Sprintf("Connection %s: ", uuid.NewRandom()),
 			log:    mc,
 		}
 		go p.start(nodes)
