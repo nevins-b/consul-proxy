@@ -13,7 +13,6 @@ import (
 	"github.com/hashicorp/consul/api"
 )
 
-var connid = uint64(0)
 var listenAddress = flag.String("listen", "127.0.0.1:8000", "Listen address")
 var consulServer = flag.String("consul", "127.0.0.1:8500", "Address of Consul Server")
 var service = flag.String("service", "upstream", "Service name in Consul")
@@ -197,7 +196,6 @@ func main() {
 			mc <- fmt.Sprintf("Failed to accept connection '%s'\n", err)
 			continue
 		}
-		connid++
 
 		select {
 		case n := <-consulChannel:
