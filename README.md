@@ -8,3 +8,4 @@ A TCP proxy which uses Consul for discovery of upstream servers.
 - Better error handling
 - Plugable logging
 - Support for different load balancing algorithms
+- Catch signals for graceful shutdown
