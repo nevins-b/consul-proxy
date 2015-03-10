@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log"
 	"math/rand"
 	"net"
 	"time"
@@ -11,6 +12,15 @@ import (
 	"code.google.com/p/go-uuid/uuid"
 
 	"github.com/hashicorp/consul/api"
+)
+
+const (
+	// retryInterval is the base retry value
+	retryInterval = 5 * time.Second
+
+	// maximum back off time, this is to prevent
+	// exponential runaway
+	maxBackoffTime = 30 * time.Second
 )
 
 var listenAddress = flag.String("listen", "127.0.0.1:8000", "Listen address")
@@ -27,7 +37,7 @@ type proxy struct {
 	erred         bool
 	errsig        chan bool
 	prefix        string
-	log           chan string
+	logChannel    chan string
 }
 
 func (p *proxy) err(s string, err error) {
@@ -35,16 +45,20 @@ func (p *proxy) err(s string, err error) {
 		return
 	}
 	if err != io.EOF {
-		p.log <- p.prefix + s
+		p.log(s)
 	}
 	p.errsig <- true
 	p.erred = true
 }
 
+func (p *proxy) log(msg string) {
+	p.logChannel <- fmt.Sprintf("%s: %s", p.prefix, msg)
+}
+
 func (p *proxy) start(nodes []*api.CatalogService) {
 	defer p.lconn.Close()
 	if len(nodes) == 0 {
-		p.log <- fmt.Sprintf("%s No backend servers available!", p.prefix)
+		p.log("No backend servers available!")
 		return
 	}
 	order := rand.Perm(len(nodes))
@@ -59,26 +73,26 @@ func (p *proxy) start(nodes []*api.CatalogService) {
 				p.rconn = rconn
 				break
 			} else {
-				p.log <- fmt.Sprintf("%s Error connecting to %s: %s", p.prefix, remoteAddr, err.Error())
+				p.log(fmt.Sprintf("Error connecting to %s: %s", remoteAddr, err.Error()))
 			}
 		} else {
-			p.log <- fmt.Sprintf("%s Error resolving %s: %s", p.prefix, remoteAddr, err.Error())
+			p.log(fmt.Sprintf("Error resolving %s: %s", remoteAddr, err.Error()))
 		}
 		if i+1 == len(nodes) {
-			p.log <- fmt.Sprintf("%s Could not connect to any upstream servers!", p.prefix)
+			p.log("Could not connect to any upstream servers!")
 			return
 		}
 	}
 
 	defer p.rconn.Close()
 	//display both ends
-	p.log <- fmt.Sprintf("%s Opened %s >>> %s", p.prefix, p.lconn.RemoteAddr().String(), p.rconn.RemoteAddr().String())
+	p.log(fmt.Sprintf("Opened %s >>> %s", p.lconn.RemoteAddr().String(), p.rconn.RemoteAddr().String()))
 	//bidirectional copy
 	go p.pipe(p.lconn, p.rconn)
 	go p.pipe(p.rconn, p.lconn)
 	//wait for close...
 	<-p.errsig
-	p.log <- fmt.Sprintf("%s Closed (%d bytes sent, %d bytes recieved)", p.prefix, p.sentBytes, p.receivedBytes)
+	p.log(fmt.Sprintf("Closed (%d bytes sent, %d bytes recieved)", p.sentBytes, p.receivedBytes))
 }
 
 func (p *proxy) pipe(src, dst *net.TCPConn) {
@@ -108,9 +122,9 @@ func (p *proxy) pipe(src, dst *net.TCPConn) {
 
 		//show output
 		if *veryverbose {
-			p.log <- fmt.Sprintf(f, n, "\n"+fmt.Sprintf(h, b))
+			p.log(fmt.Sprintf(f, n, "\n"+fmt.Sprintf(h, b)))
 		} else if *verbose {
-			p.log <- fmt.Sprintf(f, n, "")
+			p.log(fmt.Sprintf(f, n, ""))
 		}
 		//write out result
 		n, err = dst.Write(b)
@@ -138,21 +152,31 @@ func check(err error, mc chan string) {
 func logger(mc chan string) {
 	for {
 		msg := <-mc
-		fmt.Printf(msg + "\n")
+		fmt.Println(msg)
 	}
-
 }
 
 func consulQuery(service string, tag string, client *api.Client, options *api.QueryOptions, channel chan []*api.CatalogService) {
 	catalog := client.Catalog()
-
+	failures := 0
 	for {
-		nodes, _, err := catalog.Service(service, tag, options)
+		nodes, qm, err := catalog.Service(service, tag, options)
 		if err != nil {
-			panic(err)
+			failures++
+			retry := retryInterval * time.Duration(failures*failures)
+			if retry > maxBackoffTime {
+				retry = maxBackoffTime
+			}
+			log.Printf("Consul monitor errored: %s, retry in %s", err, retry)
+			<-time.After(retry)
+			continue
 		}
+		failures = 0
+		if options.WaitIndex == qm.LastIndex {
+			continue
+		}
+		options.WaitIndex = qm.LastIndex
 		channel <- nodes
-		time.Sleep(5 * time.Millisecond)
 	}
 }
 
@@ -170,6 +194,7 @@ func main() {
 	consulChannel := make(chan []*api.CatalogService, 1)
 
 	options := &api.QueryOptions{}
+	options.WaitTime = 10 * time.Second
 	config := api.DefaultConfig()
 	config.Address = *consulServer
 	client, _ := api.NewClient(config)
@@ -182,9 +207,6 @@ func main() {
 	for {
 		nodes = <-consulChannel
 		if len(nodes) > 0 {
-			for _, node := range nodes {
-				fmt.Println(node.Address)
-			}
 			break
 		}
 	}
@@ -204,12 +226,12 @@ func main() {
 		}
 
 		p := &proxy{
-			lconn:  conn,
-			laddr:  laddr,
-			erred:  false,
-			errsig: make(chan bool),
-			prefix: fmt.Sprintf("Connection %s: ", uuid.NewRandom()),
-			log:    mc,
+			lconn:      conn,
+			laddr:      laddr,
+			erred:      false,
+			errsig:     make(chan bool),
+			prefix:     fmt.Sprintf("Connection %s: ", uuid.NewRandom()),
+			logChannel: mc,
 		}
 		go p.start(nodes)
 	}
